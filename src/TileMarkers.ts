@@ -288,30 +288,32 @@ export default class TileMarkers extends Plugin {
         const cy = this.lastRightClickY - rect.top;
 
         try {
-            // Find the walkable surface under the cursor. Roofs and overhangs sit
-            // ABOVE the player's head; the ground beneath a bridge sits well below
-            // the deck. So among all pickable meshes the ray crosses, take the
-            // highest one at or below the player's head height — that's the bridge
-            // deck when on a bridge, the terrain otherwise, ignoring roofs above.
+            // Find the walkable surface under the cursor. The player's halo node
+            // sits above their head, so every surface they could stand on — terrain,
+            // a bridge deck, a building floor — is BELOW it, while roofs/overhangs
+            // are above. Among the pickable meshes the ray crosses, take the highest
+            // one at or below the halo height: that's the bridge deck when on a
+            // bridge, the floor when in a building, the terrain otherwise, and it
+            // ignores roofs overhead. (No epsilon here — a +fudge let a low roof
+            // edge sneak under the cutoff and win over the floor.)
             const halo = this.getMainPlayer()?._appearance?._haloNode?.getAbsolutePosition?.();
-            const headY = typeof halo?.y === "number" ? halo.y + 0.5 : Infinity;
+            const headY = typeof halo?.y === "number" ? halo.y : Infinity;
 
-            const hits = scene.multiPick?.(cx, cy, (mesh: any) => mesh?.isPickable) ?? [];
-            let best: any = null;
-            for (const h of hits) {
-                const p = h?.pickedPoint;
-                if (!p) continue;
-                if (p.y > headY) continue; // skip roofs/overhangs above the player
-                if (!best || p.y > best.y) best = p;
-            }
-
-            // Fallback: nothing below head height (e.g. clicked open sky) — use the
-            // closest pickable hit if any.
-            if (!best && hits.length) best = hits[0]?.pickedPoint ?? null;
-            if (!best) {
+            const points: any[] = (scene.multiPick?.(cx, cy, (mesh: any) => mesh?.isPickable) ?? [])
+                .map((h: any) => h?.pickedPoint)
+                .filter((p: any) => p && isFinite(p.y));
+            if (!points.length) {
                 this.warn("no walkable surface at pointer");
                 return null;
             }
+
+            const belowHead = points.filter((p: any) => p.y <= headY);
+            // Prefer the highest surface at/under head height; if the click only
+            // crossed things above the head (e.g. a roof you're not on), fall back
+            // to the lowest hit so we never snap a marker onto a roof.
+            const best = belowHead.length
+                ? belowHead.reduce((a, b) => (b.y > a.y ? b : a))
+                : points.reduce((a, b) => (b.y < a.y ? b : a));
 
             return {
                 x: Math.floor(best.x),

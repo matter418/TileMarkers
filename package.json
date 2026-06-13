@@ -1,6 +1,6 @@
 {
   "name": "TileMarkers",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Shift + right-click any tile in the 3D world to mark it with a colored border and a floating label.",
   "packageManager": "yarn@4.9.1",
   "engines": {
