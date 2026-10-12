@@ -1,6 +1,6 @@
 # TileMarkers
 
-A Highspell+ plugin for [High Spell](https://highspell.com).
+A [Highspell+](https://github.com/matter418/HighSpellPlus) plugin for [High Spell](https://highspell.com).
 
 Hold **Shift** and **right-click** any tile in the 3D world to mark it with a colored border and a floating label. Marks persist across sessions.
 
