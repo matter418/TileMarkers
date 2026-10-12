@@ -1,5 +1,6 @@
 import { Plugin, SettingsTypes, ContextMenuManager, EntityType } from "@ryelite/core";
 import { Vector3, Matrix } from "@babylonjs/core/Maths/math.js";
+import { MARKER_PRESETS } from "./presets";
 
 // Action labels shown in the game's right-click menu.
 const MARK_ACTION = "Mark tile";
@@ -36,6 +37,21 @@ export default class TileMarkers extends Plugin {
 
     private renderObserver: any = null;
     private observedScene: any = null;
+
+    // ---- Render-loop change detection + DOM reuse ---------------------------
+    // renderFrame runs on every engine frame (100+ Hz). It used to rebuild the SVG
+    // and label layer with innerHTML each time, which churned thousands of DOM
+    // nodes per second (Blink keeps those outside the JS heap and frees them
+    // lazily, so the renderer process ballooned). Now: skip the frame entirely
+    // when nothing relevant changed, and otherwise update elements in place.
+    private markersVersion = 0;
+    private lastTransform = new Float32Array(16);
+    private lastFrameKey = "";
+    private polyPool: SVGPolygonElement[] = [];
+    private labelPool: HTMLDivElement[] = [];
+    private scratchCorners = [new Vector3(), new Vector3(), new Vector3(), new Vector3()];
+    private scratchProjected = [new Vector3(), new Vector3(), new Vector3(), new Vector3()];
+    private identityMatrix = Matrix.Identity();
 
     private markActionNumber = -1;
     private unmarkActionNumber = -1;
@@ -142,6 +158,17 @@ export default class TileMarkers extends Plugin {
             value: true,
             callback: () => this.refreshLabelVisibility(),
         };
+        // Built-in marker sets (e.g. "T3 Maps"). Each is a simple on/off toggle;
+        // they are drawn on top of the user's own markers and never touch the
+        // Import/Export field or the saved marker list.
+        for (const preset of MARKER_PRESETS) {
+            this.settings[preset.settingKey] = {
+                text: preset.settingText,
+                type: SettingsTypes.checkbox,
+                value: false,
+                callback: () => {},
+            };
+        }
         this.settings.clearAll = {
             text: "Clear all markers",
             type: SettingsTypes.button,
@@ -231,6 +258,9 @@ export default class TileMarkers extends Plugin {
 
         if (this.overlayEl?.parentNode) this.overlayEl.parentNode.removeChild(this.overlayEl);
         this.overlayEl = null;
+        this.polyPool = [];
+        this.labelPool = [];
+        this.lastFrameKey = "";
         this.svgEl = null;
         this.labelLayerEl = null;
 
@@ -357,6 +387,33 @@ export default class TileMarkers extends Plugin {
         this.markers.length = 0;
         this.data.markers = this.markers;
         this.syncExportField();
+    }
+
+    // ---- Built-in presets ---------------------------------------------------
+
+    /**
+     * Everything to draw this frame: the user's markers plus the tiles of every
+     * preset whose toggle is on. A preset tile is skipped when the user already
+     * has their own marker on that tile, so the user's label/color wins.
+     */
+    private getVisibleMarkers(): TileMarker[] {
+        let out = this.markers;
+        for (const preset of MARKER_PRESETS) {
+            if (this.settings[preset.settingKey]?.value !== true) continue;
+            if (out === this.markers) out = this.markers.slice();
+            for (const t of preset.tiles) {
+                if (this.findMarkerIndex(t.x, t.z, t.level) >= 0) continue;
+                out.push({
+                    x: t.x,
+                    z: t.z,
+                    y: t.y,
+                    level: t.level,
+                    label: preset.label,
+                    color: preset.color,
+                });
+            }
+        }
+        return out;
     }
 
     // ---- Create / edit panel ------------------------------------------------
@@ -529,6 +586,7 @@ export default class TileMarkers extends Plugin {
 
     /** Keep the export field showing the current markers (for copy-out). */
     private syncExportField(): void {
+        this.markersVersion++;
         const code = this.serializeMarkers();
         if (this.settings.importExport) {
             this.settings.importExport.value = code;
@@ -694,59 +752,108 @@ export default class TileMarkers extends Plugin {
 
         const rw = engine.getRenderWidth(1);
         const rh = engine.getRenderHeight(1);
-        const viewport = camera.viewport.toGlobal(rw, rh);
         const transform = scene.getTransformMatrix();
-        const identity = Matrix.Identity();
+        const tm: ArrayLike<number> = transform.m;
 
+        // --- Change detection: bail out when nothing that affects the overlay moved.
+        let cameraMoved = false;
+        for (let i = 0; i < 16; i++) {
+            if (tm[i] !== this.lastTransform[i]) { cameraMoved = true; break; }
+        }
         const currentLevel = this.getPlayerLevel();
         const showLabels = this.settings.showLabels?.value !== false;
-
-        const polys: string[] = [];
-        const labelEntries: { left: number; top: number; text: string; color: string }[] = [];
-
-        for (const m of this.markers) {
-            if (!isFinite(m.x) || !isFinite(m.y) || !isFinite(m.z)) continue;
-            if ((m.level ?? 0) !== currentLevel) continue;
-
-            const corners = [
-                new Vector3(m.x, m.y, m.z),
-                new Vector3(m.x + 1, m.y, m.z),
-                new Vector3(m.x + 1, m.y, m.z + 1),
-                new Vector3(m.x, m.y, m.z + 1),
-            ];
-            const projected = corners.map(c =>
-                Vector3.Project(c, identity, transform, viewport)
-            );
-            if (projected.some(p => !isFinite(p.x) || !isFinite(p.y))) continue;
-            const allBehind = projected.every(p => p.z < 0 || p.z > 1);
-            if (allBehind) continue;
-
-            const points = projected.map(p => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ");
-            polys.push(
-                `<polygon points="${points}" fill="none" stroke="${escapeHtml(m.color)}" stroke-width="2" />`
-            );
-
-            if (showLabels && m.label) {
-                const cx = (projected[0].x + projected[2].x) / 2;
-                const cy = Math.min(projected[0].y, projected[1].y, projected[2].y, projected[3].y);
-                labelEntries.push({ left: cx, top: cy, text: m.label, color: m.color });
-            }
-        }
-
         const w = this.overlayEl?.clientWidth ?? rw;
         const h = this.overlayEl?.clientHeight ?? rh;
+        let presetKey = "";
+        for (const preset of MARKER_PRESETS) {
+            presetKey += this.settings[preset.settingKey]?.value === true ? "1" : "0";
+        }
+        const frameKey = `${rw}x${rh}|${w}x${h}|${currentLevel}|${showLabels ? 1 : 0}|${this.markersVersion}|${presetKey}`;
+        if (!cameraMoved && frameKey === this.lastFrameKey) return;
+        for (let i = 0; i < 16; i++) this.lastTransform[i] = tm[i];
+        this.lastFrameKey = frameKey;
+
+        const viewport = camera.viewport.toGlobal(rw, rh);
         const scaleX = w / rw;
         const scaleY = h / rh;
 
-        this.svgEl.setAttribute("viewBox", `0 0 ${rw} ${rh}`);
-        this.svgEl.setAttribute("preserveAspectRatio", "none");
-        this.svgEl.innerHTML = polys.join("");
-
-        let labelHtml = "";
-        for (const l of labelEntries) {
-            labelHtml += `<div class="tm-label" style="left:${(l.left * scaleX).toFixed(1)}px;top:${(l.top * scaleY).toFixed(1)}px;border:1px solid ${escapeHtml(l.color)}">${escapeHtml(l.text)}</div>`;
+        if (this.svgEl.getAttribute("viewBox") !== `0 0 ${rw} ${rh}`) {
+            this.svgEl.setAttribute("viewBox", `0 0 ${rw} ${rh}`);
+            this.svgEl.setAttribute("preserveAspectRatio", "none");
         }
-        this.labelLayerEl.innerHTML = labelHtml;
+
+        const corners = this.scratchCorners;
+        const projected = this.scratchProjected;
+        let polyCount = 0;
+        let labelCount = 0;
+
+        for (const m of this.getVisibleMarkers()) {
+            if (!isFinite(m.x) || !isFinite(m.y) || !isFinite(m.z)) continue;
+            if ((m.level ?? 0) !== currentLevel) continue;
+
+            corners[0].set(m.x, m.y, m.z);
+            corners[1].set(m.x + 1, m.y, m.z);
+            corners[2].set(m.x + 1, m.y, m.z + 1);
+            corners[3].set(m.x, m.y, m.z + 1);
+
+            let bad = false;
+            let allBehind = true;
+            for (let i = 0; i < 4; i++) {
+                Vector3.ProjectToRef(corners[i], this.identityMatrix, transform, viewport, projected[i]);
+                const p = projected[i];
+                if (!isFinite(p.x) || !isFinite(p.y)) { bad = true; break; }
+                if (!(p.z < 0 || p.z > 1)) allBehind = false;
+            }
+            if (bad || allBehind) continue;
+
+            // --- polygon: reuse an element from the pool
+            let poly = this.polyPool[polyCount];
+            if (!poly) {
+                poly = document.createElementNS("http://www.w3.org/2000/svg", "polygon");
+                poly.setAttribute("fill", "none");
+                poly.setAttribute("stroke-width", "2");
+                this.polyPool.push(poly);
+            }
+            if (poly.parentNode !== this.svgEl) this.svgEl.appendChild(poly);
+            poly.setAttribute(
+                "points",
+                `${projected[0].x.toFixed(1)},${projected[0].y.toFixed(1)} ` +
+                `${projected[1].x.toFixed(1)},${projected[1].y.toFixed(1)} ` +
+                `${projected[2].x.toFixed(1)},${projected[2].y.toFixed(1)} ` +
+                `${projected[3].x.toFixed(1)},${projected[3].y.toFixed(1)}`
+            );
+            if (poly.getAttribute("stroke") !== m.color) poly.setAttribute("stroke", m.color);
+            polyCount++;
+
+            // --- label: reuse a div from the pool
+            if (showLabels && m.label) {
+                const cx = (projected[0].x + projected[2].x) / 2;
+                const cy = Math.min(projected[0].y, projected[1].y, projected[2].y, projected[3].y);
+                let div = this.labelPool[labelCount];
+                if (!div) {
+                    div = document.createElement("div");
+                    div.className = "tm-label";
+                    this.labelPool.push(div);
+                }
+                if (div.parentNode !== this.labelLayerEl) this.labelLayerEl.appendChild(div);
+                div.style.left = `${(cx * scaleX).toFixed(1)}px`;
+                div.style.top = `${(cy * scaleY).toFixed(1)}px`;
+                const border = `1px solid ${m.color}`;
+                if (div.style.border !== border) div.style.border = border;
+                if (div.textContent !== m.label) div.textContent = m.label;
+                labelCount++;
+            }
+        }
+
+        // Detach pooled elements that are not needed this frame (kept for reuse).
+        for (let i = polyCount; i < this.polyPool.length; i++) {
+            const el = this.polyPool[i];
+            if (el.parentNode) el.parentNode.removeChild(el);
+        }
+        for (let i = labelCount; i < this.labelPool.length; i++) {
+            const el = this.labelPool[i];
+            if (el.parentNode) el.parentNode.removeChild(el);
+        }
     }
 }
 
