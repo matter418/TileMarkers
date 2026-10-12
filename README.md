@@ -1,6 +1,6 @@
 # TileMarkers
 
-A [RyeLite](https://github.com/RyeL1te) plugin for the High Spell client.
+A Highspell+ plugin for [High Spell](https://highspell.com).
 
 Hold **Shift** and **right-click** any tile in the 3D world to mark it with a colored border and a floating label. Marks persist across sessions.
 
@@ -19,7 +19,7 @@ yarn install
 yarn build
 ```
 
-The built bundle is written to `dist/TileMarkers.js`. For local testing, copy that file into `RyeliteDesktop/src/renderer/client/plugins/` and start the client with `yarn dev` from the RyeliteDesktop root.
+The built bundle is written to `dist/TileMarkers.js`. For local testing, copy that file into the Highspell+ client's `src/renderer/client/plugins/` and start the client with `yarn dev` from its root.
 
 ## License
 
